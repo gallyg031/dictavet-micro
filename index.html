@@ -1,0 +1,540 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="referrer" content="no-referrer">
+<meta name="robots" content="noindex, nofollow">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; media-src blob:; img-src data:; base-uri 'none'; form-action 'none'">
+<meta name="theme-color" content="#31444c">
+<title>DictaVet · Dictaphone</title>
+<!--
+  DictaVet — page dictaphone externe (PLAN_MVP Lot 5).
+  Page statique autonome : aucune dépendance, aucun secret, aucun appel réseau
+  (la CSP ci-dessus interdit toute connexion). Elle enregistre la voix et la rend :
+   1. à l'app DictaVet qui l'a ouverte, par postMessage (window.opener, ou la fenêtre
+      qui l'a contactée par un « ping »), avec contrôle strict de l'origine ;
+   2. sinon, par téléchargement / partage du fichier, à déposer ensuite dans l'app.
+
+  Paramètres d'URL (posés par l'app) :
+    o = origine de la page DictaVet (doit correspondre à ALLOWED_ORIGINS)
+    n = jeton aléatoire de l'ouverture (8 à 64 caractères [A-Za-z0-9_-])
+
+  Protocole (tous les messages portent src, v, n) :
+    page → app : hello { via }            à l'ouverture et en réponse à un ping
+                 start { id, mime, size, durationMs, total }
+                 chunk { id, i, data }    base64, CHUNK caractères au plus
+                 end   { id }
+    app → page : ping                     (src 'vetdict-app')
+                 ack   { id, size }       réception complète
+-->
+<style>
+  :root{
+    --ardoise:#31444c; --ardoise-2:#22323a; --cuivre:#875a35; --cuivre-2:#6e4828;
+    --fond:#f7f4ef; --carte:#ffffff; --ligne:#ddd5ca; --texte:#1f2a2f; --doux:#5b6a70;
+    --ok:#2f6b3a; --ok-fond:#e6f1e7; --alerte:#8a5a00; --alerte-fond:#fdf1d6;
+    --err:#9b2c1f; --err-fond:#fbe5e1;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;background:var(--fond);color:var(--texte)}
+  body{font:18px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Arial,sans-serif;
+       -webkit-text-size-adjust:100%;padding:env(safe-area-inset-top) 16px calc(24px + env(safe-area-inset-bottom))}
+  .wrap{max-width:520px;margin:0 auto}
+  header{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:14px 0 10px}
+  .brand{font-weight:700;font-size:20px;color:var(--ardoise);letter-spacing:.2px}
+  .brand span{color:var(--cuivre)}
+  .link{font-size:14px;font-weight:600;border-radius:999px;padding:6px 12px;background:#e9e4dc;color:var(--doux);white-space:nowrap}
+  .link.on{background:var(--ok-fond);color:var(--ok)}
+  .link.off{background:var(--alerte-fond);color:var(--alerte)}
+  .card{background:var(--carte);border:1px solid var(--ligne);border-radius:18px;padding:20px 16px;margin:10px 0}
+  .center{text-align:center}
+  #recBtn{width:168px;height:168px;border-radius:50%;border:0;margin:6px auto 4px;display:flex;align-items:center;
+          justify-content:center;flex-direction:column;gap:6px;background:var(--cuivre);color:#fff;font-family:inherit;font-weight:700;font-size:19px;line-height:1.1;
+          box-shadow:0 6px 0 var(--cuivre-2);cursor:pointer;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
+  #recBtn:active{transform:translateY(3px);box-shadow:0 3px 0 var(--cuivre-2)}
+  #recBtn.rec{background:var(--ardoise);box-shadow:0 6px 0 var(--ardoise-2)}
+  #recBtn[disabled]{opacity:.45;cursor:default}
+  #recBtn svg{width:54px;height:54px;fill:#fff}
+  .timer{font:700 44px/1 ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--ardoise);margin:14px 0 2px;font-variant-numeric:tabular-nums}
+  .sub{color:var(--doux);font-size:15px}
+  .meter{height:18px;border-radius:9px;background:#ece6dd;overflow:hidden;margin:16px 0 6px;border:1px solid var(--ligne)}
+  .meter i{display:block;height:100%;width:0;background:linear-gradient(90deg,#4f7d5a,#7fa35c 60%,#c08a3e);transition:width .08s linear}
+  .hear{font-size:15px;font-weight:600;min-height:22px}
+  .hear.yes{color:var(--ok)} .hear.no{color:var(--alerte)}
+  .msg{border-radius:14px;padding:12px 14px;margin:10px 0;font-size:16px}
+  .msg b{display:block;margin-bottom:2px}
+  .msg.err{background:var(--err-fond);color:var(--err)}
+  .msg.warn{background:var(--alerte-fond);color:var(--alerte)}
+  .msg.ok{background:var(--ok-fond);color:var(--ok)}
+  .msg.info{background:#e9eef0;color:var(--ardoise)}
+  .hidden{display:none!important}
+  audio{width:100%;margin:6px 0 10px}
+  .facts{display:flex;flex-wrap:wrap;gap:6px 14px;font-size:15px;color:var(--doux);margin-bottom:12px}
+  .facts b{color:var(--texte)}
+  .btn{display:flex;width:100%;min-height:58px;align-items:center;justify-content:center;gap:10px;border-radius:14px;
+       border:2px solid var(--ardoise);background:#fff;color:var(--ardoise);font-family:inherit;font-weight:700;font-size:18px;line-height:1.2;margin:10px 0 0;
+       padding:10px 14px;cursor:pointer;text-decoration:none;touch-action:manipulation}
+  .btn.primary{background:var(--ardoise);color:#fff}
+  .btn.copper{background:var(--cuivre);border-color:var(--cuivre);color:#fff}
+  .btn[disabled]{opacity:.45;cursor:default}
+  .foot{font-size:13px;color:var(--doux);margin:16px 2px 0}
+  @media (max-height:640px){#recBtn{width:136px;height:136px}.timer{font-size:36px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div class="brand">Vet<span>Dict</span> · Dictaphone</div>
+    <div class="link" id="link">…</div>
+  </header>
+
+  <div id="boot" class="msg info hidden"></div>
+
+  <section class="card center" id="recCard">
+    <button id="recBtn" type="button" aria-label="Commencer l'enregistrement">
+      <svg id="icoMic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-2.1a7 7 0 0 0 6-6.9h-2z"/></svg>
+      <svg id="icoStop" class="hidden" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+      <span id="recLabel">Enregistrer</span>
+    </button>
+    <div class="timer" id="timer">00:00</div>
+    <div class="sub" id="limit">Limite : 10 minutes</div>
+    <div class="meter" aria-hidden="true"><i id="level"></i></div>
+    <div class="hear" id="hear">&nbsp;</div>
+    <div id="recMsg"></div>
+  </section>
+
+  <section class="card hidden" id="reviewCard">
+    <div style="font-weight:700;color:var(--ardoise);margin-bottom:6px">Réécouter avant d'envoyer</div>
+    <audio id="player" controls preload="metadata"></audio>
+    <div class="facts" id="facts"></div>
+    <button class="btn primary" id="sendBtn" type="button">Envoyer à DictaVet</button>
+    <div id="sendMsg"></div>
+    <a class="btn" id="dlBtn" href="#" download>Télécharger l'enregistrement</a>
+    <button class="btn hidden" id="shareBtn" type="button">Partager l'enregistrement…</button>
+    <button class="btn" id="againBtn" type="button">Recommencer</button>
+  </section>
+
+  <div id="resume" class="msg warn hidden"></div>
+
+  <p class="foot">L'enregistrement reste sur cet appareil jusqu'à son envoi à DictaVet. Cette page n'envoie rien sur Internet.
+  Gardez-la ouverte et l'écran allumé pendant la dictée.</p>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ---------------- Réglages ---------------- */
+  var MAX_MS = 10 * 60 * 1000;          // limite de durée
+  var WARN_MS = 9 * 60 * 1000;          // avertissement une minute avant
+  var CHUNK = 512 * 1024;               // caractères base64 par message
+  var ACK_WAIT_MS = 10000;              // attente de l'accusé de réception
+  var SILENCE_HINT_MS = 5000;           // « aucun son » au bout de 5 s de silence
+  // Origines autorisées pour l'app DictaVet. Apps Script sert le contenu HtmlService
+  // dans un cadre isolé sur un sous-domaine de googleusercontent.com (« …-script.
+  // googleusercontent.com », à confirmer par l'essai A qui affiche l'origine réelle).
+  // Après l'essai : remplacer par l'origine exacte relevée, pour se fermer aux autres
+  // projets Apps Script.
+  var ALLOWED_ORIGINS = [
+    /^https:\/\/script\.google\.com$/,
+    /^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)*\.googleusercontent\.com$/
+  ];
+  // Formats candidats, par ordre de préférence. Débit réduit : la voix reste
+  // intelligible, et Gemini ré-échantillonne de toute façon à 16 kbit/s.
+  var FORMATS = [
+    { mime: 'audio/webm;codecs=opus', bps: 24000, ext: 'webm' },   // Chrome, Edge, Android
+    { mime: 'audio/ogg;codecs=opus', bps: 24000, ext: 'ogg' },     // Firefox
+    { mime: 'audio/mp4;codecs=mp4a.40.2', bps: 32000, ext: 'm4a' },// Safari (iPhone, Mac)
+    { mime: 'audio/mp4', bps: 32000, ext: 'm4a' },
+    { mime: 'audio/aac', bps: 32000, ext: 'aac' }
+  ];
+  var DB_NAME = 'vetdict-micro', DB_STORE = 'rec', KEEP_MS = 24 * 3600 * 1000;
+
+  /* ---------------- Utilitaires ---------------- */
+  var $ = function (id) { return document.getElementById(id); };
+  function show(el, on) { el.classList.toggle('hidden', !on); }
+  function msg(boxId, kind, title, text) {
+    var box = $(boxId);
+    box.innerHTML = '';
+    if (!kind) return;
+    var d = document.createElement('div');
+    d.className = 'msg ' + kind;
+    if (title) { var b = document.createElement('b'); b.textContent = title; d.appendChild(b); }
+    if (text) d.appendChild(document.createTextNode(text));
+    box.appendChild(d);
+  }
+  function pad(n) { return (n < 10 ? '0' : '') + n; }
+  function clock(ms) { var s = Math.floor(ms / 1000); return pad(Math.floor(s / 60)) + ':' + pad(s % 60); }
+  function size(b) { return b < 1048576 ? Math.max(1, Math.round(b / 1024)) + ' Ko' : (b / 1048576).toFixed(1).replace('.', ',') + ' Mo'; }
+  function originOk(o) { return ALLOWED_ORIGINS.some(function (re) { return re.test(o); }); }
+  function randomId() {
+    var a = new Uint8Array(9);
+    (window.crypto || window.msCrypto).getRandomValues(a);
+    return Array.prototype.map.call(a, function (x) { return (x % 36).toString(36); }).join('');
+  }
+
+  /* ---------------- Liaison avec l'app ---------------- */
+  var params = new URLSearchParams(location.search);
+  var appOrigin = params.get('o') || '';
+  var nonce = params.get('n') || '';
+  var linked = !!appOrigin && originOk(appOrigin) && /^[A-Za-z0-9_-]{8,64}$/.test(nonce);
+  var peer = null;          // fenêtre de l'app (opener, ou source d'un ping)
+  var peerVia = '';
+  var pendingAck = null;    // { id, size, timer }
+
+  function post(m) {
+    if (!peer) return false;
+    m.src = 'vetdict-micro'; m.v = 1; m.n = nonce;
+    try { peer.postMessage(m, appOrigin); return true; } catch (e) { return false; }
+  }
+  function setLink() {
+    var el = $('link');
+    if (!linked) { el.className = 'link off'; el.textContent = 'Mode autonome'; return; }
+    el.className = 'link ' + (peer ? 'on' : 'off');
+    el.textContent = peer ? 'Relié à DictaVet' : 'DictaVet non joint';
+  }
+
+  if (appOrigin && !linked) {
+    $('boot').textContent = 'Adresse d\'ouverture non reconnue (' + appOrigin.slice(0, 80) +
+      ') : la page fonctionne en mode autonome. Téléchargez l\'enregistrement puis déposez-le dans DictaVet.';
+    show($('boot'), true);
+  }
+  if (linked) {
+    try { if (window.opener && !window.opener.closed) { peer = window.opener; peerVia = 'opener'; } }
+    catch (e) { peer = null; }
+    if (peer) post({ kind: 'hello', via: peerVia });
+    window.addEventListener('message', function (ev) {
+      var d = ev.data;
+      if (!d || typeof d !== 'object' || d.src !== 'vetdict-app') return;
+      if (ev.origin !== appOrigin || d.n !== nonce) return;  // origine et jeton exacts
+      if (!peer || peerVia !== 'opener') { peer = ev.source; peerVia = peerVia || 'ping'; }
+      if (d.kind === 'ping') { post({ kind: 'hello', via: peerVia }); setLink(); updateSend(); }
+      else if (d.kind === 'ack' && pendingAck && d.id === pendingAck.id) onAck(d);
+    });
+  }
+  setLink();
+
+  /* ---------------- Enregistrement ---------------- */
+  var st = { stream: null, rec: null, chunks: [], fmt: null, t0: 0, elapsed: 0, tick: 0,
+             ctx: null, raf: 0, lastSound: 0, warned: false, wake: null, hidden: false, stopReason: '' };
+  var result = null; // { blob, mime, ext, durationMs, at }
+
+  function pickFormat() {
+    if (typeof MediaRecorder === 'undefined') return null;
+    for (var i = 0; i < FORMATS.length; i++) {
+      try { if (MediaRecorder.isTypeSupported(FORMATS[i].mime)) return FORMATS[i]; } catch (e) { /* suivant */ }
+    }
+    return { mime: '', bps: 32000, ext: '' }; // format par défaut du navigateur
+  }
+  function extFor(mime) {
+    mime = (mime || '').toLowerCase();
+    if (mime.indexOf('webm') >= 0) return 'webm';
+    if (mime.indexOf('ogg') >= 0) return 'ogg';
+    if (mime.indexOf('mp4') >= 0 || mime.indexOf('m4a') >= 0) return 'm4a';
+    if (mime.indexOf('aac') >= 0) return 'aac';
+    return 'audio';
+  }
+
+  function explainError(e) {
+    var n = (e && e.name) || '';
+    if (n === 'NotAllowedError' || n === 'SecurityError' || n === 'PermissionDeniedError') {
+      return ['Accès au micro refusé.', 'Autorisez le micro pour cette page : sur iPhone, Réglages › Safari › Micro (ou « aA » dans la barre d\'adresse › Réglages du site) ; sur Android, touchez le cadenas à gauche de l\'adresse › Autorisations › Micro. Puis rechargez la page.'];
+    }
+    if (n === 'NotFoundError' || n === 'DevicesNotFoundError' || n === 'OverconstrainedError') {
+      return ['Aucun micro détecté.', 'Branchez ou activez un micro, puis réessayez.'];
+    }
+    if (n === 'NotReadableError' || n === 'TrackStartError' || n === 'AbortError') {
+      return ['Le micro est occupé.', 'Une autre application l\'utilise peut-être (appel, dictaphone). Fermez-la puis réessayez.'];
+    }
+    return ['Le micro n\'a pas pu démarrer.', (n ? n + ' : ' : '') + ((e && e.message) || String(e))];
+  }
+
+  function unsupported() {
+    if (!window.isSecureContext) return 'Cette page doit être ouverte en https:// pour accéder au micro.';
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) return 'Ce navigateur ne donne pas accès au micro. Utilisez Chrome (Android, ordinateur) ou Safari (iPhone) à jour.';
+    if (typeof MediaRecorder === 'undefined') return 'Ce navigateur ne sait pas enregistrer le son. Mettez à jour Safari (iOS 14.5 ou plus récent) ou utilisez Chrome.';
+    return '';
+  }
+
+  function setRecUi(on) {
+    $('recBtn').classList.toggle('rec', on);
+    $('recBtn').setAttribute('aria-label', on ? 'Arrêter l\'enregistrement' : 'Commencer l\'enregistrement');
+    $('recLabel').textContent = on ? 'Arrêter' : 'Enregistrer';
+    show($('icoMic'), !on); show($('icoStop'), on);
+  }
+
+  function start() {
+    var why = unsupported();
+    if (why) { msg('recMsg', 'err', 'Enregistrement impossible.', why); return; }
+    if (result && !result.sent && !confirm('Remplacer l\'enregistrement précédent ?')) return;
+    msg('recMsg'); msg('sendMsg');
+    $('recBtn').disabled = true;
+    navigator.mediaDevices.getUserMedia({
+      audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }
+    }).then(function (stream) {
+      st.stream = stream;
+      st.fmt = pickFormat();
+      var rec;
+      try {
+        var opts = { audioBitsPerSecond: st.fmt.bps };
+        if (st.fmt.mime) opts.mimeType = st.fmt.mime;
+        rec = new MediaRecorder(stream, opts);
+      } catch (e) {
+        rec = new MediaRecorder(stream); // réglages refusés : format par défaut
+      }
+      st.rec = rec; st.chunks = [];
+      rec.ondataavailable = function (ev) { if (ev.data && ev.data.size) st.chunks.push(ev.data); };
+      rec.onstop = finish;
+      rec.onerror = function (ev) { msg('recMsg', 'err', 'Erreur d\'enregistrement.', String((ev && ev.error) || ev)); };
+      rec.start(1000);
+      st.t0 = Date.now(); st.elapsed = 0; st.warned = false; st.hidden = false; st.stopReason = '';
+      st.lastSound = Date.now();
+      st.tick = setInterval(onTick, 250);
+      startMeter(stream);
+      keepAwake(true);
+      setRecUi(true);
+      show($('reviewCard'), false);
+      $('recBtn').disabled = false;
+    }).catch(function (e) {
+      $('recBtn').disabled = false;
+      var t = explainError(e);
+      msg('recMsg', 'err', t[0], t[1]);
+    });
+  }
+
+  function stop(reason) {
+    if (!st.rec || st.rec.state === 'inactive') return;
+    st.stopReason = reason || '';
+    st.elapsed = Date.now() - st.t0;
+    try { st.rec.stop(); } catch (e) { finish(); }
+  }
+
+  function cleanup() {
+    clearInterval(st.tick);
+    stopMeter();
+    keepAwake(false);
+    if (st.stream) st.stream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) { /* déjà arrêté */ } });
+    st.stream = null;
+    setRecUi(false);
+  }
+
+  function finish() {
+    var mime = (st.rec && st.rec.mimeType) || (st.fmt && st.fmt.mime) || (st.chunks[0] && st.chunks[0].type) || 'audio/webm';
+    var blob = new Blob(st.chunks, { type: mime });
+    var dur = st.elapsed || (Date.now() - st.t0);
+    st.rec = null;
+    cleanup();
+    if (!blob.size) { msg('recMsg', 'err', 'Enregistrement vide.', 'Aucun son n\'a été enregistré. Réessayez.'); return; }
+    setResult({ blob: blob, mime: mime, ext: (st.fmt && st.fmt.ext) || extFor(mime), durationMs: dur, at: Date.now() });
+    if (st.stopReason === 'max') msg('recMsg', 'warn', 'Limite de 10 minutes atteinte.', 'L\'enregistrement a été arrêté. Envoyez-le, puis commencez-en un autre pour la suite.');
+    else if (st.hidden) msg('recMsg', 'warn', 'La page a été quittée pendant l\'enregistrement.', 'Réécoutez pour vérifier que tout a été pris.');
+    saveLocal(result);
+  }
+
+  function onTick() {
+    var ms = Date.now() - st.t0;
+    $('timer').textContent = clock(ms);
+    if (ms >= WARN_MS && !st.warned) {
+      st.warned = true;
+      msg('recMsg', 'warn', 'Plus qu\'une minute.', 'L\'enregistrement s\'arrêtera automatiquement à 10 minutes.');
+      try { navigator.vibrate && navigator.vibrate([200, 100, 200]); } catch (e) { /* pas de vibreur */ }
+    }
+    if (ms >= MAX_MS) stop('max');
+  }
+
+  /* ---------------- Niveau sonore ---------------- */
+  function startMeter(stream) {
+    var AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) { $('hear').textContent = 'Niveau sonore indisponible sur ce navigateur.'; return; }
+    try {
+      var ctx = new AC();
+      var src = ctx.createMediaStreamSource(stream);
+      var an = ctx.createAnalyser();
+      an.fftSize = 1024;
+      src.connect(an);
+      if (ctx.resume) ctx.resume();
+      st.ctx = ctx;
+      var buf = new Uint8Array(an.fftSize);
+      var loop = function () {
+        an.getByteTimeDomainData(buf);
+        var sum = 0;
+        for (var i = 0; i < buf.length; i++) { var v = (buf[i] - 128) / 128; sum += v * v; }
+        var rms = Math.sqrt(sum / buf.length);
+        var lvl = Math.min(1, Math.sqrt(rms) * 1.6); // échelle « perçue » : la voix normale remplit la moitié
+        $('level').style.width = Math.round(lvl * 100) + '%';
+        if (rms > 0.02) st.lastSound = Date.now();
+        var quiet = Date.now() - st.lastSound > SILENCE_HINT_MS;
+        var h = $('hear');
+        h.className = 'hear ' + (quiet ? 'no' : 'yes');
+        h.textContent = quiet ? 'Aucun son capté : parlez plus près du téléphone, ou vérifiez le micro.' : 'Le micro capte votre voix.';
+        st.raf = requestAnimationFrame(loop);
+      };
+      loop();
+    } catch (e) {
+      $('hear').textContent = 'Niveau sonore indisponible (' + e.name + ').';
+    }
+  }
+  function stopMeter() {
+    cancelAnimationFrame(st.raf);
+    if (st.ctx) { try { st.ctx.close(); } catch (e) { /* déjà fermé */ } }
+    st.ctx = null;
+    $('level').style.width = '0';
+    $('hear').innerHTML = '&nbsp;';
+  }
+
+  /* ---------------- Écran allumé ---------------- */
+  function keepAwake(on) {
+    if (!('wakeLock' in navigator)) return;
+    if (!on) { if (st.wake) { st.wake.release().catch(function () {}); st.wake = null; } return; }
+    navigator.wakeLock.request('screen').then(function (w) { st.wake = w; }).catch(function () { st.wake = null; });
+  }
+  document.addEventListener('visibilitychange', function () {
+    var recording = st.rec && st.rec.state === 'recording';
+    if (document.visibilityState === 'hidden' && recording) st.hidden = true;
+    if (document.visibilityState === 'visible' && recording && !st.wake) keepAwake(true);
+  });
+  window.addEventListener('beforeunload', function (ev) {
+    if ((st.rec && st.rec.state === 'recording') || (result && !result.sent)) { ev.preventDefault(); ev.returnValue = ''; }
+  });
+
+  /* ---------------- Réécoute, envoi, repli ---------------- */
+  var objectUrl = '';
+  function setResult(r) {
+    result = r;
+    if (objectUrl) URL.revokeObjectURL(objectUrl);
+    objectUrl = URL.createObjectURL(r.blob);
+    $('player').src = objectUrl;
+    $('timer').textContent = clock(r.durationMs);
+    var d = new Date(r.at);
+    var name = 'dictee-' + d.getFullYear() + pad(d.getMonth() + 1) + pad(d.getDate()) + '-' + pad(d.getHours()) + pad(d.getMinutes()) + '.' + (r.ext || 'audio');
+    r.name = name;
+    $('dlBtn').href = objectUrl;
+    $('dlBtn').setAttribute('download', name);
+    var f = $('facts'); f.innerHTML = '';
+    [['Durée', clock(r.durationMs)], ['Taille', size(r.blob.size)], ['Format', (r.mime.split(';')[0] || '?').replace('audio/', '')]]
+      .forEach(function (x) { var s = document.createElement('span'); s.innerHTML = x[0] + ' : <b></b>'; s.lastChild.textContent = x[1]; f.appendChild(s); });
+    var canShare = false;
+    try {
+      r.file = new File([r.blob], name, { type: r.mime.split(';')[0] });
+      canShare = !!(navigator.canShare && navigator.canShare({ files: [r.file] }));
+    } catch (e) { canShare = false; }
+    show($('shareBtn'), canShare);
+    show($('reviewCard'), true);
+    show($('resume'), false);
+    updateSend();
+  }
+
+  function updateSend() {
+    var b = $('sendBtn');
+    if (!result) return;
+    if (!linked) { show(b, false); return; }
+    show(b, true);
+    b.disabled = !peer || !!pendingAck || !!result.sent;
+    if (!peer) msg('sendMsg', 'warn', 'DictaVet n\'est pas joignable depuis cette page.', 'Téléchargez l\'enregistrement, puis déposez-le dans DictaVet (bouton « Importer un enregistrement »).');
+  }
+
+  function toBase64(blob) {
+    return new Promise(function (res, rej) {
+      var fr = new FileReader();
+      fr.onload = function () { var s = String(fr.result); res(s.slice(s.indexOf(',') + 1)); };
+      fr.onerror = function () { rej(fr.error); };
+      fr.readAsDataURL(blob);
+    });
+  }
+
+  function send() {
+    if (!result || !peer || pendingAck) return;
+    var r = result;
+    $('sendBtn').disabled = true;
+    msg('sendMsg', 'info', 'Envoi en cours…', '');
+    toBase64(r.blob).then(function (b64) {
+      var id = randomId(), total = Math.max(1, Math.ceil(b64.length / CHUNK));
+      var ok = post({ kind: 'start', id: id, mime: r.mime, size: r.blob.size, durationMs: r.durationMs, total: total, chars: b64.length });
+      for (var i = 0; ok && i < total; i++) ok = post({ kind: 'chunk', id: id, i: i, data: b64.slice(i * CHUNK, (i + 1) * CHUNK) });
+      ok = ok && post({ kind: 'end', id: id });
+      if (!ok) throw new Error('la fenêtre DictaVet a refusé le message');
+      pendingAck = { id: id, size: r.blob.size, timer: setTimeout(noAck, ACK_WAIT_MS) };
+    }).catch(function (e) {
+      pendingAck = null;
+      msg('sendMsg', 'err', 'Envoi impossible.', (e && e.message ? e.message : String(e)) + '. Téléchargez l\'enregistrement puis déposez-le dans DictaVet.');
+      updateSend();
+    });
+  }
+
+  function onAck(d) {
+    clearTimeout(pendingAck.timer);
+    var good = d.size === pendingAck.size;
+    pendingAck = null;
+    if (!good) { msg('sendMsg', 'err', 'Réception incomplète.', 'DictaVet a reçu ' + size(d.size || 0) + ' au lieu de ' + size(result.blob.size) + '. Renvoyez, ou téléchargez l\'enregistrement.'); updateSend(); return; }
+    result.sent = true;
+    clearLocal();
+    msg('sendMsg', 'ok', 'Reçu par DictaVet.', 'Vous pouvez fermer cette page et revenir à DictaVet.');
+    updateSend();
+    setTimeout(function () { try { window.close(); } catch (e) { /* fermeture refusée */ } }, 1500);
+  }
+
+  function noAck() {
+    pendingAck = null;
+    msg('sendMsg', 'warn', 'DictaVet n\'a pas confirmé la réception.', 'Revenez à DictaVet pour vérifier. Sinon, téléchargez l\'enregistrement puis déposez-le dans DictaVet.');
+    updateSend();
+  }
+
+  $('recBtn').addEventListener('click', function () {
+    if (st.rec && st.rec.state === 'recording') stop('user'); else start();
+  });
+  $('sendBtn').addEventListener('click', send);
+  $('againBtn').addEventListener('click', function () { start(); });
+  $('shareBtn').addEventListener('click', function () {
+    if (!result || !result.file) return;
+    navigator.share({ files: [result.file], title: result.name }).catch(function (e) {
+      if (e && e.name !== 'AbortError') msg('sendMsg', 'err', 'Partage impossible.', e.message || String(e));
+    });
+  });
+
+  /* ---------------- Filet anti-perte (IndexedDB, 24 h) ---------------- */
+  function db() {
+    return new Promise(function (res, rej) {
+      if (!window.indexedDB) return rej(new Error('IndexedDB absent'));
+      var rq = indexedDB.open(DB_NAME, 1);
+      rq.onupgradeneeded = function () { rq.result.createObjectStore(DB_STORE); };
+      rq.onsuccess = function () { res(rq.result); };
+      rq.onerror = function () { rej(rq.error); };
+    });
+  }
+  function tx(mode, fn) {
+    return db().then(function (d) {
+      return new Promise(function (res, rej) {
+        var t = d.transaction(DB_STORE, mode), out;
+        out = fn(t.objectStore(DB_STORE));
+        t.oncomplete = function () { res(out && out.result); d.close(); };
+        t.onerror = function () { rej(t.error); d.close(); };
+      });
+    });
+  }
+  function saveLocal(r) {
+    tx('readwrite', function (s) { return s.put({ blob: r.blob, mime: r.mime, ext: r.ext, durationMs: r.durationMs, at: r.at }, 'last'); })
+      .catch(function () { /* stockage indisponible : pas de filet */ });
+  }
+  function clearLocal() { tx('readwrite', function (s) { return s.delete('last'); }).catch(function () {}); }
+  tx('readonly', function (s) { return s.get('last'); }).then(function (r) {
+    if (!r || !r.blob) return;
+    if (Date.now() - r.at > KEEP_MS) { clearLocal(); return; }
+    var d = new Date(r.at), box = $('resume');
+    box.innerHTML = '';
+    var b = document.createElement('b');
+    b.textContent = 'Un enregistrement non envoyé du ' + pad(d.getDate()) + '/' + pad(d.getMonth() + 1) + ' à ' + pad(d.getHours()) + 'h' + pad(d.getMinutes()) + ' (' + clock(r.durationMs) + ') est disponible.';
+    box.appendChild(b);
+    var k = document.createElement('button'); k.className = 'btn primary'; k.type = 'button'; k.textContent = 'Le reprendre';
+    k.onclick = function () { setResult(r); };
+    var x = document.createElement('button'); x.className = 'btn'; x.type = 'button'; x.textContent = 'L\'effacer';
+    x.onclick = function () { clearLocal(); show(box, false); };
+    box.appendChild(k); box.appendChild(x);
+    show(box, true);
+  }).catch(function () { /* rien à reprendre */ });
+
+  var why = unsupported();
+  if (why) { msg('recMsg', 'err', 'Enregistrement impossible.', why); $('recBtn').disabled = true; }
+})();
+</script>
+</body>
+</html>
