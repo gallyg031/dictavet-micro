@@ -5,28 +5,30 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex, nofollow">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; media-src blob:; img-src data:; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; connect-src https://script.google.com https://script.googleusercontent.com; script-src 'unsafe-inline'; style-src 'unsafe-inline'; media-src blob:; img-src data:; base-uri 'none'; form-action 'none'">
 <meta name="theme-color" content="#31444c">
 <title>DictaVet · Dictaphone</title>
 <!--
   DictaVet — page dictaphone externe (PLAN_MVP Lot 5).
-  Page statique autonome : aucune dépendance, aucun secret, aucun appel réseau
-  (la CSP ci-dessus interdit toute connexion). Elle enregistre la voix et la rend :
-   1. à l'app DictaVet qui l'a ouverte, par postMessage (window.opener, ou la fenêtre
-      qui l'a contactée par un « ping »), avec contrôle strict de l'origine ;
-   2. sinon, par téléchargement / partage du fichier, à déposer ensuite dans l'app.
+  Page statique autonome : aucune dépendance, aucun secret. Elle enregistre la voix et :
+   1. la DÉPOSE directement sur le serveur DictaVet (web app Apps Script, doPost) avec le
+      jeton à usage unique reçu de l'app ; l'app vient la chercher quand elle est au premier
+      plan (src/MicroDepot.gs). L'onglet de l'app peut dormir pendant la dictée (essai du
+      20/11/2026 : l'envoi par postMessage vers un onglet endormi se perdait).
+      Seules connexions permises par la CSP : script.google.com et sa redirection.
+   2. sinon, la propose en téléchargement / partage, à déposer ensuite dans l'app.
 
   Paramètres d'URL (posés par l'app) :
-    o = origine de la page DictaVet (doit correspondre à ALLOWED_ORIGINS)
-    n = jeton aléatoire de l'ouverture (8 à 64 caractères [A-Za-z0-9_-])
+    t = jeton de dépôt (48 à 96 caractères [A-Za-z0-9])
+    u = adresse de la web app (https://script.google.com/macros/s/…/exec, seule forme admise)
 
-  Protocole (tous les messages portent src, v, n) :
-    page → app : hello { via }            à l'ouverture et en réponse à un ping
-                 start { id, mime, size, durationMs, total }
-                 chunk { id, i, data }    base64, CHUNK caractères au plus
-                 end   { id }
-    app → page : ping                     (src 'vetdict-app')
-                 ack   { id, size }       réception complète
+  Le jeton et l'adresse sont gardés avec l'enregistrement (IndexedDB) : un enregistrement
+  repris après fermeture de la page s'envoie encore, tant que le jeton est valide (12 h).
+
+  Envoi : POST u, corps texte JSON { t, mime, durationMs, data } (requête « simple », sans
+  pré-vol CORS), réponse { ok, code, message }. Tant que la web app est en accès « moi
+  uniquement », la réponse n'est pas lisible : second essai en no-cors avec les cookies
+  Google ; c'est alors l'app qui confirme la réception.
 -->
 <style>
   :root{
@@ -84,7 +86,7 @@
 <body>
 <div class="wrap">
   <header>
-    <div class="brand">Vet<span>Dict</span> · Dictaphone</div>
+    <div class="brand">Dicta<span>Vet</span> · Dictaphone</div>
     <div class="link" id="link">…</div>
   </header>
 
@@ -116,7 +118,7 @@
 
   <div id="resume" class="msg warn hidden"></div>
 
-  <p class="foot">L'enregistrement reste sur cet appareil jusqu'à son envoi à DictaVet. Cette page n'envoie rien sur Internet.
+  <p class="foot">L'enregistrement reste sur cet appareil jusqu'à ce que vous l'envoyiez. Il ne part que vers le serveur DictaVet, nulle part ailleurs.
   Gardez-la ouverte et l'écran allumé pendant la dictée.</p>
 </div>
 
@@ -127,18 +129,11 @@
   /* ---------------- Réglages ---------------- */
   var MAX_MS = 10 * 60 * 1000;          // limite de durée
   var WARN_MS = 9 * 60 * 1000;          // avertissement une minute avant
-  var CHUNK = 512 * 1024;               // caractères base64 par message
-  var ACK_WAIT_MS = 10000;              // attente de l'accusé de réception
+  var SEND_TIMEOUT_MS = 120000;         // délai maximal d'un envoi
   var SILENCE_HINT_MS = 5000;           // « aucun son » au bout de 5 s de silence
-  // Origines autorisées pour l'app DictaVet. Apps Script sert le contenu HtmlService
-  // dans un cadre isolé sur un sous-domaine de googleusercontent.com (« …-script.
-  // googleusercontent.com », à confirmer par l'essai A qui affiche l'origine réelle).
-  // Après l'essai : remplacer par l'origine exacte relevée, pour se fermer aux autres
-  // projets Apps Script.
-  var ALLOWED_ORIGINS = [
-    /^https:\/\/script\.google\.com$/,
-    /^https:\/\/[a-z0-9-]+(\.[a-z0-9-]+)*\.googleusercontent\.com$/
-  ];
+  // Seule cible d'envoi admise : une web app Apps Script (l'audio ne part jamais ailleurs,
+  // même avec un lien fabriqué). /dev : déploiement de test, propriétaire seulement.
+  var POST_URL_RE = /^https:\/\/script\.google\.com\/(a\/[a-z0-9.-]+\/)?macros\/s\/[A-Za-z0-9_-]{20,}\/(exec|dev)$/;
   // Formats candidats, par ordre de préférence. Débit réduit : la voix reste
   // intelligible, et Gemini ré-échantillonne de toute façon à 16 kbit/s.
   var FORMATS = [
@@ -166,51 +161,23 @@
   function pad(n) { return (n < 10 ? '0' : '') + n; }
   function clock(ms) { var s = Math.floor(ms / 1000); return pad(Math.floor(s / 60)) + ':' + pad(s % 60); }
   function size(b) { return b < 1048576 ? Math.max(1, Math.round(b / 1024)) + ' Ko' : (b / 1048576).toFixed(1).replace('.', ',') + ' Mo'; }
-  function originOk(o) { return ALLOWED_ORIGINS.some(function (re) { return re.test(o); }); }
-  function randomId() {
-    var a = new Uint8Array(9);
-    (window.crypto || window.msCrypto).getRandomValues(a);
-    return Array.prototype.map.call(a, function (x) { return (x % 36).toString(36); }).join('');
-  }
+  function linkOk(t, u) { return /^[A-Za-z0-9]{48,96}$/.test(t || '') && POST_URL_RE.test(u || ''); }
 
   /* ---------------- Liaison avec l'app ---------------- */
   var params = new URLSearchParams(location.search);
-  var appOrigin = params.get('o') || '';
-  var nonce = params.get('n') || '';
-  var linked = !!appOrigin && originOk(appOrigin) && /^[A-Za-z0-9_-]{8,64}$/.test(nonce);
-  var peer = null;          // fenêtre de l'app (opener, ou source d'un ping)
-  var peerVia = '';
-  var pendingAck = null;    // { id, size, timer }
+  var link = { t: params.get('t') || '', u: params.get('u') || '' };
+  var linked = linkOk(link.t, link.u);
+  var sending = false;
 
-  function post(m) {
-    if (!peer) return false;
-    m.src = 'vetdict-micro'; m.v = 1; m.n = nonce;
-    try { peer.postMessage(m, appOrigin); return true; } catch (e) { return false; }
-  }
   function setLink() {
     var el = $('link');
-    if (!linked) { el.className = 'link off'; el.textContent = 'Mode autonome'; return; }
-    el.className = 'link ' + (peer ? 'on' : 'off');
-    el.textContent = peer ? 'Relié à DictaVet' : 'DictaVet non joint';
+    el.className = 'link ' + (linked ? 'on' : 'off');
+    el.textContent = linked ? 'Relié à DictaVet' : 'Mode autonome';
   }
-
-  if (appOrigin && !linked) {
-    $('boot').textContent = 'Adresse d\'ouverture non reconnue (' + appOrigin.slice(0, 80) +
-      ') : la page fonctionne en mode autonome. Téléchargez l\'enregistrement puis déposez-le dans DictaVet.';
+  if ((link.t || link.u) && !linked) {
+    $('boot').textContent = 'Lien d\'ouverture non reconnu : la page fonctionne en mode autonome. ' +
+      'Rouvrez le dictaphone depuis DictaVet, ou téléchargez l\'enregistrement puis déposez-le dans DictaVet.';
     show($('boot'), true);
-  }
-  if (linked) {
-    try { if (window.opener && !window.opener.closed) { peer = window.opener; peerVia = 'opener'; } }
-    catch (e) { peer = null; }
-    if (peer) post({ kind: 'hello', via: peerVia });
-    window.addEventListener('message', function (ev) {
-      var d = ev.data;
-      if (!d || typeof d !== 'object' || d.src !== 'vetdict-app') return;
-      if (ev.origin !== appOrigin || d.n !== nonce) return;  // origine et jeton exacts
-      if (!peer || peerVia !== 'opener') { peer = ev.source; peerVia = peerVia || 'ping'; }
-      if (d.kind === 'ping') { post({ kind: 'hello', via: peerVia }); setLink(); updateSend(); }
-      else if (d.kind === 'ack' && pendingAck && d.id === pendingAck.id) onAck(d);
-    });
   }
   setLink();
 
@@ -400,6 +367,9 @@
   /* ---------------- Réécoute, envoi, repli ---------------- */
   var objectUrl = '';
   function setResult(r) {
+    // Lien d'envoi : celui de l'ouverture en cours, sinon celui gardé avec l'enregistrement.
+    if (!linked && r.link && linkOk(r.link.t, r.link.u)) { link = r.link; linked = true; setLink(); }
+    r.link = linked ? { t: link.t, u: link.u } : null;
     result = r;
     if (objectUrl) URL.revokeObjectURL(objectUrl);
     objectUrl = URL.createObjectURL(r.blob);
@@ -434,8 +404,7 @@
       return;
     }
     show(b, true);
-    b.disabled = !peer || !!pendingAck || !!result.sent;
-    if (!peer) msg('sendMsg', 'warn', 'DictaVet n\'est pas joignable depuis cette page.', 'Téléchargez l\'enregistrement, puis déposez-le dans DictaVet (bouton « Importer un enregistrement »).');
+    b.disabled = sending || !!result.sent;
   }
 
   function toBase64(blob) {
@@ -447,44 +416,56 @@
     });
   }
 
-  function send() {
-    if (!result || !peer || pendingAck) return;
-    var r = result;
-    $('sendBtn').disabled = true;
-    msg('sendMsg', 'info', 'Envoi en cours…', '');
-    toBase64(r.blob).then(function (b64) {
-      var id = randomId(), total = Math.max(1, Math.ceil(b64.length / CHUNK));
-      var ok = post({ kind: 'start', id: id, mime: r.mime, size: r.blob.size, durationMs: r.durationMs, total: total, chars: b64.length });
-      for (var i = 0; ok && i < total; i++) ok = post({ kind: 'chunk', id: id, i: i, data: b64.slice(i * CHUNK, (i + 1) * CHUNK) });
-      ok = ok && post({ kind: 'end', id: id });
-      if (!ok) throw new Error('la fenêtre DictaVet a refusé le message');
-      pendingAck = { id: id, size: r.blob.size, timer: setTimeout(noAck, ACK_WAIT_MS) };
-    }).catch(function (e) {
-      pendingAck = null;
-      msg('sendMsg', 'err', 'Envoi impossible.', (e && e.message ? e.message : String(e)) + '. Téléchargez l\'enregistrement puis déposez-le dans DictaVet.');
-      updateSend();
+  function withTimeout(p) {
+    return new Promise(function (res, rej) {
+      var tm = setTimeout(function () { rej(new Error('délai dépassé')); }, SEND_TIMEOUT_MS);
+      p.then(function (x) { clearTimeout(tm); res(x); }, function (e) { clearTimeout(tm); rej(e); });
     });
   }
 
-  function onAck(d) {
-    clearTimeout(pendingAck.timer);
-    var good = d.size === pendingAck.size;
-    pendingAck = null;
-    if (!good) { msg('sendMsg', 'err', 'Réception incomplète.', 'DictaVet a reçu ' + size(d.size || 0) + ' au lieu de ' + size(result.blob.size) + '. Renvoyez, ou téléchargez l\'enregistrement.'); updateSend(); return; }
+  var RETOUR = 'Revenez à DictaVet par le bouton des onglets du navigateur (le carré avec un chiffre, en haut à droite sur Android) : la dictée y sera transcrite.';
+
+  // keep : réception non confirmée → la copie locale est gardée (24 h) pour pouvoir la reprendre.
+  function done(kind, title, text, keep) {
+    sending = false;
     result.sent = true;
-    clearLocal();
-    msg('sendMsg', 'ok', 'Reçu par DictaVet.', 'Vous pouvez fermer cette page et revenir à DictaVet.');
+    if (!keep) clearLocal();
+    msg('sendMsg', kind, title, text);
     updateSend();
-    setTimeout(function () { try { window.close(); } catch (e) { /* fermeture refusée */ } }, 1500);
   }
 
-  function noAck() {
-    pendingAck = null;
-    msg('sendMsg', 'warn', 'DictaVet n\'a pas confirmé la réception.',
-      'L\'enregistrement est gardé sur ce téléphone, rien n\'est perdu. Touchez « Envoyer à DictaVet » pour réessayer. ' +
-      'Si cela échoue encore : revenez à DictaVet par le bouton des onglets du navigateur (le carré avec un chiffre, en haut à droite sur Android) ' +
-      'et touchez de nouveau le bouton qui ouvre le dictaphone. Le dictaphone vous proposera de reprendre cet enregistrement.');
-    updateSend();
+  function send() {
+    if (!result || !linked || sending || result.sent) return;
+    var r = result, l = r.link || link;
+    sending = true; updateSend();
+    msg('sendMsg', 'info', 'Envoi en cours…', 'Gardez cette page ouverte quelques secondes.');
+    toBase64(r.blob).then(function (b64) {
+      var body = JSON.stringify({ t: l.t, mime: r.mime, durationMs: r.durationMs, data: b64 });
+      // 1) Réponse lisible : web app ouverte en accès anonyme (après le Lot 6).
+      return withTimeout(fetch(l.u, { method: 'POST', body: body, credentials: 'omit', redirect: 'follow' }))
+        .then(function (resp) { return resp.json(); })
+        .then(function (j) { return { readable: true, j: j }; }, function () {
+          // 2) Réponse illisible (accès « moi uniquement » : connexion Google exigée, CORS) :
+          //    envoi avec les cookies Google, sans pouvoir lire la réponse.
+          return withTimeout(fetch(l.u, { method: 'POST', body: body, mode: 'no-cors', credentials: 'include', redirect: 'follow' }))
+            .then(function () { return { readable: false }; });
+        });
+    }).then(function (x) {
+      if (!x.readable) {
+        done('ok', 'Envoyé.', RETOUR + ' Si elle n\'y arrive pas, rouvrez le dictaphone depuis DictaVet : cet enregistrement vous sera reproposé.', true);
+        return;
+      }
+      var j = x.j || {};
+      if (j.ok || j.code === 'DEJA') { done('ok', 'Reçu par DictaVet.', RETOUR); return; }
+      sending = false;
+      msg('sendMsg', 'err', 'Envoi refusé.', (j.message || 'Erreur inconnue.') + ' Vous pouvez aussi télécharger l\'enregistrement puis le déposer dans DictaVet.');
+      updateSend();
+    }).catch(function (e) {
+      sending = false;
+      msg('sendMsg', 'err', 'Envoi impossible.', (e && e.message ? e.message : String(e)) +
+        '. Vérifiez la connexion Internet puis touchez de nouveau « Envoyer à DictaVet ». L\'enregistrement reste gardé sur ce téléphone.');
+      updateSend();
+    });
   }
 
   $('recBtn').addEventListener('click', function () {
@@ -520,7 +501,7 @@
     });
   }
   function saveLocal(r) {
-    tx('readwrite', function (s) { return s.put({ blob: r.blob, mime: r.mime, ext: r.ext, durationMs: r.durationMs, at: r.at }, 'last'); })
+    tx('readwrite', function (s) { return s.put({ blob: r.blob, mime: r.mime, ext: r.ext, durationMs: r.durationMs, at: r.at, link: r.link || null }, 'last'); })
       .catch(function () { /* stockage indisponible : pas de filet */ });
   }
   function clearLocal() { tx('readwrite', function (s) { return s.delete('last'); }).catch(function () {}); }
