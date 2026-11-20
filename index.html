@@ -322,7 +322,18 @@
       if (ctx.resume) ctx.resume();
       st.ctx = ctx;
       var buf = new Uint8Array(an.fftSize);
+      if (ctx.state === 'suspended') {
+        // Démarrage automatique sans geste : la jauge attend le premier toucher (l'enregistrement, lui, tourne).
+        var wake = function () { try { ctx.resume(); } catch (e) { /* tant pis */ } };
+        document.addEventListener('pointerdown', wake, { once: true });
+      }
       var loop = function () {
+        if (ctx.state === 'suspended') {
+          st.lastSound = Date.now();
+          $('hear').className = 'hear yes';
+          $('hear').textContent = 'Enregistrement en cours : parlez. (Touchez l\'écran pour voir le niveau sonore.)';
+          st.raf = requestAnimationFrame(loop); return;
+        }
         an.getByteTimeDomainData(buf);
         var sum = 0;
         for (var i = 0; i < buf.length; i++) { var v = (buf[i] - 128) / 128; sum += v * v; }
@@ -506,8 +517,8 @@
   }
   function clearLocal() { tx('readwrite', function (s) { return s.delete('last'); }).catch(function () {}); }
   tx('readonly', function (s) { return s.get('last'); }).then(function (r) {
-    if (!r || !r.blob) return;
-    if (Date.now() - r.at > KEEP_MS) { clearLocal(); return; }
+    if (!r || !r.blob) return false;
+    if (Date.now() - r.at > KEEP_MS) { clearLocal(); return false; }
     var d = new Date(r.at), box = $('resume');
     box.innerHTML = '';
     var b = document.createElement('b');
@@ -519,10 +530,24 @@
     x.onclick = function () { clearLocal(); show(box, false); };
     box.appendChild(k); box.appendChild(x);
     show(box, true);
-  }).catch(function () { /* rien à reprendre */ });
+    return true;
+  }).catch(function () { return false; /* rien à reprendre */ }).then(autoStart);
 
   var why = unsupported();
   if (why) { msg('recMsg', 'err', 'Enregistrement impossible.', why); $('recBtn').disabled = true; }
+
+  /* ---------------- Démarrage automatique ----------------
+     Ouverte depuis DictaVet (lien valide), la page enregistre tout de suite : le véto a
+     déjà touché le micro dans l'app. Une seule fois par lien et par onglet (sessionStorage),
+     pour qu'un onglet rechargé par Android ne relance pas un enregistrement ; jamais s'il
+     reste un enregistrement non envoyé à reprendre. Si le navigateur refuse le micro sans
+     geste, le bouton « Enregistrer » reste là. */
+  function autoStart(leftover) {
+    if (!linked || leftover || why || result) return;
+    var key = 'dictavet-auto-' + link.t.slice(0, 16);
+    try { if (sessionStorage.getItem(key)) return; sessionStorage.setItem(key, '1'); } catch (e) { /* sans stockage : on démarre quand même */ }
+    start();
+  }
 })();
 </script>
 </body>
