@@ -55,6 +55,8 @@
           box-shadow:0 6px 0 var(--cuivre-2);cursor:pointer;-webkit-tap-highlight-color:transparent;touch-action:manipulation}
   #recBtn:active{transform:translateY(3px);box-shadow:0 3px 0 var(--cuivre-2)}
   #recBtn.rec{background:var(--ardoise);box-shadow:0 6px 0 var(--ardoise-2)}
+  .timer.paused{color:var(--cuivre);animation:blink 1.2s steps(2,start) infinite}
+  @keyframes blink{to{visibility:hidden}}
   #recBtn[disabled]{opacity:.45;cursor:default}
   #recBtn svg{width:54px;height:54px;fill:#fff}
   .timer{font:700 44px/1 ui-monospace,"SF Mono",Menlo,Consolas,monospace;color:var(--ardoise);margin:14px 0 2px;font-variant-numeric:tabular-nums}
@@ -95,11 +97,12 @@
   <section class="card center" id="recCard">
     <button id="recBtn" type="button" aria-label="Commencer l'enregistrement">
       <svg id="icoMic" viewBox="0 0 24 24" aria-hidden="true"><path d="M12 15a3 3 0 0 0 3-3V6a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-2.1a7 7 0 0 0 6-6.9h-2z"/></svg>
-      <svg id="icoStop" class="hidden" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="6" width="12" height="12" rx="2"/></svg>
+      <svg id="icoStop" class="hidden" viewBox="0 0 24 24" aria-hidden="true"><rect x="6" y="5" width="4" height="14" rx="1.2"/><rect x="14" y="5" width="4" height="14" rx="1.2"/></svg>
       <span id="recLabel">Enregistrer</span>
     </button>
     <div class="timer" id="timer">00:00</div>
-    <div class="sub" id="limit">Limite : 10 minutes</div>
+    <div class="sub" id="limit">Pause possible à tout moment · limite : 10 minutes de dictée</div>
+    <button class="btn primary hidden" id="doneBtn" type="button">Terminer la dictée</button>
     <div class="meter" aria-hidden="true"><i id="level"></i></div>
     <div class="hear" id="hear">&nbsp;</div>
     <div id="recMsg"></div>
@@ -119,7 +122,7 @@
   <div id="resume" class="msg warn hidden"></div>
 
   <p class="foot">L'enregistrement reste sur cet appareil jusqu'à ce que vous l'envoyiez. Il ne part que vers le serveur DictaVet, nulle part ailleurs.
-  Gardez-la ouverte et l'écran allumé pendant la dictée.</p>
+  Pendant que vous parlez, gardez la page ouverte et l'écran allumé. Pour examiner entre deux phrases, touchez « Pause » : ce qui est déjà dicté est gardé sur le téléphone, et « Reprendre » continue la même dictée.</p>
 </div>
 
 <script>
@@ -182,7 +185,7 @@
   setLink();
 
   /* ---------------- Enregistrement ---------------- */
-  var st = { stream: null, rec: null, chunks: [], fmt: null, t0: 0, elapsed: 0, tick: 0,
+  var st = { stream: null, rec: null, chunks: [], fmt: null, t0: 0, seg: 0, acc: 0, elapsed: 0, tick: 0, saveTick: 0,
              ctx: null, raf: 0, lastSound: 0, warned: false, wake: null, hidden: false, stopReason: '' };
   var result = null; // { blob, mime, ext, durationMs, at }
 
@@ -223,11 +226,44 @@
     return '';
   }
 
-  function setRecUi(on) {
+  // mode : 'idle' (rien en cours), 'rec' (enregistre), 'pause' (en pause, micro gardé ouvert).
+  function setRecUi(mode) {
+    var on = mode === 'rec', paused = mode === 'pause';
     $('recBtn').classList.toggle('rec', on);
-    $('recBtn').setAttribute('aria-label', on ? 'Arrêter l\'enregistrement' : 'Commencer l\'enregistrement');
-    $('recLabel').textContent = on ? 'Arrêter' : 'Enregistrer';
+    $('recBtn').setAttribute('aria-label', on ? 'Mettre en pause' : paused ? 'Reprendre l\'enregistrement' : 'Commencer l\'enregistrement');
+    $('recLabel').textContent = on ? 'Pause' : paused ? 'Reprendre' : 'Enregistrer';
     show($('icoMic'), !on); show($('icoStop'), on);
+    show($('doneBtn'), on || paused);
+    $('timer').classList.toggle('paused', paused);
+  }
+  function canPause() { return !!(st.rec && typeof st.rec.pause === 'function' && typeof st.rec.resume === 'function'); }
+  // Temps de dictée effectif (pauses exclues).
+  function recordedMs() { return st.acc + (st.rec && st.rec.state === 'recording' ? Date.now() - st.seg : 0); }
+
+  function pause() {
+    if (!st.rec || st.rec.state !== 'recording') return;
+    try { st.rec.pause(); } catch (e) { stop('user'); return; }
+    st.acc += Date.now() - st.seg;
+    setRecUi('pause');
+    keepAwake(false); // l'écran peut s'éteindre pendant la pause
+    $('timer').textContent = clock(st.acc);
+    try { st.rec.requestData(); } catch (e) { /* données déjà livrées chaque seconde */ }
+    setTimeout(savePartial, 400);
+  }
+  function resume() {
+    if (!st.rec || st.rec.state !== 'paused') return;
+    try { st.rec.resume(); } catch (e) { stop('user'); return; }
+    st.seg = Date.now(); st.lastSound = Date.now();
+    setRecUi('rec');
+    keepAwake(true);
+  }
+  // Filet anti-perte pendant une dictée longue : ce qui est déjà dit est gardé sur le téléphone
+  // (onglet tué par Android pendant une pause → « Le reprendre » au retour).
+  function savePartial() {
+    if (!st.rec || !st.chunks.length) return;
+    var mime = st.rec.mimeType || (st.fmt && st.fmt.mime) || st.chunks[0].type || 'audio/webm';
+    saveLocal({ blob: new Blob(st.chunks, { type: mime }), mime: mime, ext: (st.fmt && st.fmt.ext) || extFor(mime),
+                durationMs: recordedMs(), at: Date.now(), link: linked ? { t: link.t, u: link.u } : null });
   }
 
   function start() {
@@ -254,12 +290,13 @@
       rec.onstop = finish;
       rec.onerror = function (ev) { msg('recMsg', 'err', 'Erreur d\'enregistrement.', String((ev && ev.error) || ev)); };
       rec.start(1000);
-      st.t0 = Date.now(); st.elapsed = 0; st.warned = false; st.hidden = false; st.stopReason = '';
+      st.t0 = st.seg = Date.now(); st.acc = 0; st.elapsed = 0; st.warned = false; st.hidden = false; st.stopReason = '';
       st.lastSound = Date.now();
       st.tick = setInterval(onTick, 250);
+      st.saveTick = setInterval(function () { if (st.rec && st.rec.state === 'recording') savePartial(); }, 20000);
       startMeter(stream);
       keepAwake(true);
-      setRecUi(true);
+      setRecUi('rec');
       show($('reviewCard'), false);
       $('recBtn').disabled = false;
     }).catch(function (e) {
@@ -272,23 +309,23 @@
   function stop(reason) {
     if (!st.rec || st.rec.state === 'inactive') return;
     st.stopReason = reason || '';
-    st.elapsed = Date.now() - st.t0;
+    st.elapsed = recordedMs();
     try { st.rec.stop(); } catch (e) { finish(); }
   }
 
   function cleanup() {
-    clearInterval(st.tick);
+    clearInterval(st.tick); clearInterval(st.saveTick);
     stopMeter();
     keepAwake(false);
     if (st.stream) st.stream.getTracks().forEach(function (t) { try { t.stop(); } catch (e) { /* déjà arrêté */ } });
     st.stream = null;
-    setRecUi(false);
+    setRecUi('idle');
   }
 
   function finish() {
     var mime = (st.rec && st.rec.mimeType) || (st.fmt && st.fmt.mime) || (st.chunks[0] && st.chunks[0].type) || 'audio/webm';
     var blob = new Blob(st.chunks, { type: mime });
-    var dur = st.elapsed || (Date.now() - st.t0);
+    var dur = st.elapsed || recordedMs();
     st.rec = null;
     cleanup();
     if (!blob.size) { msg('recMsg', 'err', 'Enregistrement vide.', 'Aucun son n\'a été enregistré. Réessayez.'); return; }
@@ -299,7 +336,8 @@
   }
 
   function onTick() {
-    var ms = Date.now() - st.t0;
+    if (!st.rec || st.rec.state !== 'recording') return; // en pause : chrono figé
+    var ms = recordedMs();
     $('timer').textContent = clock(ms);
     if (ms >= WARN_MS && !st.warned) {
       st.warned = true;
@@ -328,6 +366,13 @@
         document.addEventListener('pointerdown', wake, { once: true });
       }
       var loop = function () {
+        if (st.rec && st.rec.state === 'paused') {
+          st.lastSound = Date.now();
+          $('level').style.width = '0';
+          $('hear').className = 'hear';
+          $('hear').textContent = 'En pause : touchez « Reprendre » pour continuer la même dictée.';
+          st.raf = requestAnimationFrame(loop); return;
+        }
         if (ctx.state === 'suspended') {
           st.lastSound = Date.now();
           $('hear').className = 'hear yes';
@@ -372,7 +417,7 @@
     if (document.visibilityState === 'visible' && recording && !st.wake) keepAwake(true);
   });
   window.addEventListener('beforeunload', function (ev) {
-    if ((st.rec && st.rec.state === 'recording') || (result && !result.sent)) { ev.preventDefault(); ev.returnValue = ''; }
+    if ((st.rec && st.rec.state !== 'inactive') || (result && !result.sent)) { ev.preventDefault(); ev.returnValue = ''; }
   });
 
   /* ---------------- Réécoute, envoi, repli ---------------- */
@@ -479,9 +524,15 @@
     });
   }
 
+  // Gros bouton : Enregistrer → Pause ⇄ Reprendre ; « Terminer la dictée » clôt.
+  // Navigateur sans pause (rare) : le gros bouton arrête, comme avant.
   $('recBtn').addEventListener('click', function () {
-    if (st.rec && st.rec.state === 'recording') stop('user'); else start();
+    var s = st.rec && st.rec.state;
+    if (s === 'recording') { if (canPause()) pause(); else stop('user'); }
+    else if (s === 'paused') resume();
+    else start();
   });
+  $('doneBtn').addEventListener('click', function () { stop('user'); });
   $('sendBtn').addEventListener('click', send);
   $('againBtn').addEventListener('click', function () { start(); });
   $('shareBtn').addEventListener('click', function () {
