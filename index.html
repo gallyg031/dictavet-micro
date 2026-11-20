@@ -427,7 +427,12 @@
   function updateSend() {
     var b = $('sendBtn');
     if (!result) return;
-    if (!linked) { show(b, false); return; }
+    if (!linked) {
+      show(b, false);
+      if (!result.sent) msg('sendMsg', 'info', 'Cette page n\'est pas reliée à DictaVet.',
+        'Pour envoyer cet enregistrement : retournez dans DictaVet et touchez de nouveau le bouton qui ouvre le dictaphone. Le dictaphone se rouvrira et vous proposera de reprendre cet enregistrement, avec le bouton « Envoyer à DictaVet ». Sinon, téléchargez-le puis déposez-le dans DictaVet.');
+      return;
+    }
     show(b, true);
     b.disabled = !peer || !!pendingAck || !!result.sent;
     if (!peer) msg('sendMsg', 'warn', 'DictaVet n\'est pas joignable depuis cette page.', 'Téléchargez l\'enregistrement, puis déposez-le dans DictaVet (bouton « Importer un enregistrement »).');
@@ -475,7 +480,10 @@
 
   function noAck() {
     pendingAck = null;
-    msg('sendMsg', 'warn', 'DictaVet n\'a pas confirmé la réception.', 'Revenez à DictaVet pour vérifier. Sinon, téléchargez l\'enregistrement puis déposez-le dans DictaVet.');
+    msg('sendMsg', 'warn', 'DictaVet n\'a pas confirmé la réception.',
+      'L\'enregistrement est gardé sur ce téléphone, rien n\'est perdu. Touchez « Envoyer à DictaVet » pour réessayer. ' +
+      'Si cela échoue encore : revenez à DictaVet par le bouton des onglets du navigateur (le carré avec un chiffre, en haut à droite sur Android) ' +
+      'et touchez de nouveau le bouton qui ouvre le dictaphone. Le dictaphone vous proposera de reprendre cet enregistrement.');
     updateSend();
   }
 
