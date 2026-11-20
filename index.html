@@ -252,10 +252,45 @@
   }
   function resume() {
     if (!st.rec || st.rec.state !== 'paused') return;
+    var tr = st.stream && st.stream.getAudioTracks()[0];
+    if (tr && tr.muted) {
+      msg('recMsg', 'warn', 'Le micro est encore pris.', 'Terminez l\'appel (ou fermez l\'application qui l\'utilise), puis touchez de nouveau « Reprendre ».');
+      return;
+    }
     try { st.rec.resume(); } catch (e) { stop('user'); return; }
     st.seg = Date.now(); st.lastSound = Date.now();
     setRecUi('rec');
     keepAwake(true);
+    msg('recMsg');
+  }
+
+  /* ---------------- Interruptions (appel, autre appli qui prend le micro) ----------------
+     « mute » : le système a pris le micro (appel…) → pause automatique + sauvegarde
+     immédiate, plutôt qu'un long blanc dans la dictée. « ended » : micro perdu pour de bon →
+     la dictée se termine avec ce qui a été dit (gardé, prêt à envoyer). */
+  function buzz() { try { navigator.vibrate && navigator.vibrate([300, 120, 300]); } catch (e) { /* pas de vibreur */ } }
+  function watchInterruptions(stream) {
+    var tr = stream.getAudioTracks()[0];
+    if (!tr) return;
+    tr.addEventListener('mute', function () {
+      if (!st.rec || st.stream !== stream) return;
+      if (st.rec.state === 'recording') {
+        if (canPause()) pause(); else { savePartial(); }
+      } else savePartial();
+      buzz();
+      msg('recMsg', 'warn', 'Enregistrement interrompu (appel ?).', 'Ce qui a été dit est gardé. Quand vous êtes prêt, touchez « Reprendre » pour continuer la même dictée.');
+    });
+    tr.addEventListener('unmute', function () {
+      if (st.rec && st.stream === stream && st.rec.state === 'paused') {
+        msg('recMsg', 'info', 'Le micro est de nouveau disponible.', 'Touchez « Reprendre » pour continuer la dictée.');
+      }
+    });
+    tr.addEventListener('ended', function () {
+      if (st.stream !== stream) return;
+      buzz();
+      st.stopReason = 'ended'; // le MediaRecorder peut s'arrêter de lui-même juste après
+      if (st.rec && st.rec.state !== 'inactive') stop('ended');
+    });
   }
   // Filet anti-perte pendant une dictée longue : ce qui est déjà dit est gardé sur le téléphone
   // (onglet tué par Android pendant une pause → « Le reprendre » au retour).
@@ -286,6 +321,7 @@
         rec = new MediaRecorder(stream); // réglages refusés : format par défaut
       }
       st.rec = rec; st.chunks = [];
+      watchInterruptions(stream);
       rec.ondataavailable = function (ev) { if (ev.data && ev.data.size) st.chunks.push(ev.data); };
       rec.onstop = finish;
       rec.onerror = function (ev) { msg('recMsg', 'err', 'Erreur d\'enregistrement.', String((ev && ev.error) || ev)); };
@@ -330,7 +366,8 @@
     cleanup();
     if (!blob.size) { msg('recMsg', 'err', 'Enregistrement vide.', 'Aucun son n\'a été enregistré. Réessayez.'); return; }
     setResult({ blob: blob, mime: mime, ext: (st.fmt && st.fmt.ext) || extFor(mime), durationMs: dur, at: Date.now() });
-    if (st.stopReason === 'max') msg('recMsg', 'warn', 'Limite de 10 minutes atteinte.', 'L\'enregistrement a été arrêté. Envoyez-le, puis commencez-en un autre pour la suite.');
+    if (st.stopReason === 'ended') msg('recMsg', 'warn', 'Le micro a été coupé (appel ?).', 'Tout ce qui a été dit avant est gardé ci-dessous : envoyez-le. Pour la suite, dictez un complément depuis DictaVet.');
+    else if (st.stopReason === 'max') msg('recMsg', 'warn', 'Limite de 10 minutes atteinte.', 'L\'enregistrement a été arrêté. Envoyez-le, puis commencez-en un autre pour la suite.');
     else if (st.hidden) msg('recMsg', 'warn', 'La page a été quittée pendant l\'enregistrement.', 'Réécoutez pour vérifier que tout a été pris.');
     saveLocal(result);
   }
@@ -414,6 +451,11 @@
   document.addEventListener('visibilitychange', function () {
     var recording = st.rec && st.rec.state === 'recording';
     if (document.visibilityState === 'hidden' && recording) st.hidden = true;
+    // Page quittée (appel, autre appli) : garder tout de suite ce qui a été dit.
+    if (document.visibilityState === 'hidden' && st.rec && st.rec.state !== 'inactive') {
+      try { st.rec.requestData(); } catch (e) { /* déjà livré */ }
+      setTimeout(savePartial, 300);
+    }
     if (document.visibilityState === 'visible' && recording && !st.wake) keepAwake(true);
   });
   window.addEventListener('beforeunload', function (ev) {
