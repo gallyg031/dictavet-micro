@@ -21,6 +21,8 @@
   Paramètres d'URL (posés par l'app) :
     t = jeton de dépôt (48 à 96 caractères [A-Za-z0-9])
     u = adresse de la web app (https://script.google.com/macros/s/…/exec, seule forme admise)
+    g = rubriques à dicter « nom~détail|nom~détail… » (facultatif : aide-mémoire affiché sous le chrono)
+    h = rangs des rubriques déjà dictées, séparés par des virgules (facultatif : affichées cochées)
 
   Le jeton et l'adresse sont gardés avec l'enregistrement (IndexedDB) : un enregistrement
   repris après fermeture de la page s'envoie encore, tant que le jeton est valide (12 h).
@@ -83,6 +85,25 @@
   .btn[disabled]{opacity:.45;cursor:default}
   .foot{font-size:13px;color:var(--doux);margin:16px 2px 0}
   @media (max-height:640px){#recBtn{width:136px;height:136px}.timer{font-size:36px}}
+  /* Rubriques à dicter (données par l'app) : le haut de page se resserre pour les laisser voir. */
+  .has-guide #recCard{padding:14px 16px}
+  .has-guide #recBtn{width:116px;height:116px;font-size:16px;gap:3px}
+  .has-guide #recBtn svg{width:38px;height:38px}
+  .has-guide .timer{font-size:34px;margin:10px 0 2px}
+  .has-guide .meter{margin:10px 0 4px}
+  .has-guide #limit{font-size:13px}
+  #guideCard{padding:14px 16px}
+  .g-title{font-weight:700;color:var(--ardoise);font-size:16px}
+  .g-sub{font-size:13px;color:var(--doux);margin:1px 0 8px}
+  #guideList{list-style:none;margin:0;padding:0}
+  #guideList li{display:flex;gap:10px;align-items:flex-start;padding:7px 0;border-top:1px solid #efe9e0}
+  #guideList li:first-child{border-top:0}
+  .g-mk{flex:none;width:20px;height:20px;border-radius:50%;border:2px solid var(--ligne);margin-top:2px;position:relative}
+  .g-nm{font-weight:700;font-size:16px;line-height:1.25;color:var(--texte)}
+  .g-sb{font-size:14px;line-height:1.3;color:var(--doux)}
+  #guideList li.done .g-mk{background:var(--ok);border-color:var(--ok)}
+  #guideList li.done .g-mk:after{content:"";position:absolute;left:5px;top:1px;width:4px;height:9px;border:solid #fff;border-width:0 2.5px 2.5px 0;transform:rotate(45deg)}
+  #guideList li.done .g-nm{color:var(--ok)}
 </style>
 </head>
 <body>
@@ -120,6 +141,13 @@
   </section>
 
   <div id="resume" class="msg warn hidden"></div>
+
+  <!-- Après la réécoute : « Envoyer à DictaVet » reste au-dessus de la liste. -->
+  <section class="card hidden" id="guideCard">
+    <div class="g-title">Rubriques à dicter</div>
+    <div class="g-sub" id="guideSub">Aide-mémoire : rien d'obligatoire, dans l'ordre que vous voulez.</div>
+    <ul id="guideList"></ul>
+  </section>
 
   <p class="foot">L'enregistrement reste sur cet appareil jusqu'à ce que vous l'envoyiez. Il ne part que vers le serveur DictaVet, nulle part ailleurs.
   Pendant que vous parlez, gardez la page ouverte et l'écran allumé. Pour examiner entre deux phrases, touchez « Pause » : ce qui est déjà dicté est gardé sur le téléphone, et « Reprendre » continue la même dictée.</p>
@@ -183,6 +211,33 @@
     show($('boot'), true);
   }
   setLink();
+
+  /* ---------------- Rubriques à dicter (aide-mémoire) ----------------
+     g = « nom~détail|nom~détail… », h = rangs des rubriques déjà dictées (cochées), posés par
+     l'app. Affichage seul : texte brut (textContent), nombre et longueurs bornés. Les rubriques
+     ne se cochent pas pendant qu'on parle (la dictée n'est transcrite qu'après l'envoi) :
+     c'est dans DictaVet, au retour, qu'elles se cochent. */
+  (function () {
+    var raw = params.get('g') || '';
+    if (!raw || raw.length > 4000) return;
+    var done = {};
+    (params.get('h') || '').split(',').forEach(function (x) { if (/^\d{1,2}$/.test(x)) done[+x] = true; });
+    var list = $('guideList'), n = 0, nDone = 0;
+    raw.split('|').slice(0, 30).forEach(function (item, i) {
+      var p = item.split('~'), nm = (p[0] || '').trim().slice(0, 60), sb = (p[1] || '').trim().slice(0, 90);
+      if (!nm) return;
+      var li = document.createElement('li'), mk = document.createElement('span'), tx = document.createElement('div'), a = document.createElement('div');
+      mk.className = 'g-mk'; a.className = 'g-nm'; a.textContent = nm;
+      tx.appendChild(a);
+      if (sb) { var b = document.createElement('div'); b.className = 'g-sb'; b.textContent = sb; tx.appendChild(b); }
+      if (done[i]) { li.className = 'done'; nDone++; }
+      li.appendChild(mk); li.appendChild(tx); list.appendChild(li); n++;
+    });
+    if (!n) return;
+    if (nDone) $('guideSub').textContent = 'Aide-mémoire. Cochées : déjà dictées (' + nDone + ' sur ' + n + ').';
+    document.body.classList.add('has-guide');
+    show($('guideCard'), true);
+  })();
 
   /* ---------------- Enregistrement ---------------- */
   var st = { stream: null, rec: null, chunks: [], fmt: null, t0: 0, seg: 0, acc: 0, elapsed: 0, tick: 0, saveTick: 0,
